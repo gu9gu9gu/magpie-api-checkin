@@ -25,6 +25,7 @@ import { validateCustomConfig } from "./lib/config.mjs"
 import { finiteNumber, nonEmptyString } from "./lib/http.mjs"
 import { PlatformError, checkinOf, detectPlatform, listModelIds, profileOf } from "./lib/platforms.mjs"
 import { loginProfile } from "./lib/login-checkin.mjs"
+import { hasLogin } from "./lib/session-cookie.mjs"
 import { looseNumber } from "./lib/values.mjs"
 
 const PROVIDER = "api-checkin"
@@ -366,7 +367,9 @@ const server = async ({ client } = {}, _options = {}) => {
             }
 
             // Login-style check-in: the credential that matters is the
-            // password, not a token, so a site with no token still works.
+            // password, not a token, so a site with no token still works. No
+            // access token is stored: the balance is read with the short-lived
+            // session cookie this login earns (lib/session-cookie.mjs).
             if (nonEmptyString(inputs.checkinMode) === "login") {
               // New API accepts either the account name or its e-mail here; the
               // label Magpie shows is normally the e-mail, so it is the fallback.
@@ -376,31 +379,28 @@ const server = async ({ client } = {}, _options = {}) => {
               if (!loginPassword) {
                 return { type: "failed", error: "登录式签到需要填写站点登录密码" }
               }
-              if (!loginUsername && !token) {
+              if (!loginUsername) {
                 return {
                   type: "failed",
                   error: "登录式签到需要填写站点登录邮箱或用户名",
                 }
               }
               let probed = null
-              if (!token) {
-                try {
-                  probed = await loginProfile({
-                    baseUrl,
-                    username: loginUsername,
-                    password: loginPassword,
-                  })
-                } catch (error) {
-                  return {
-                    type: "failed",
-                    error: String(error.message || error).slice(0, 500),
-                  }
+              try {
+                probed = await loginProfile({
+                  baseUrl,
+                  username: loginUsername,
+                  password: loginPassword,
+                })
+              } catch (error) {
+                return {
+                  type: "failed",
+                  error: String(error.message || error).slice(0, 500),
                 }
               }
               const profile = probed?.profile
               const userId = statedUserId ?? profile?.userId
-              const username =
-                profile?.username || loginUsername || jwtUsername(token)
+              const username = profile?.username || loginUsername || ""
               // The e-mail is what the person recognises on such a site, and it
               // is also what they sign in with, so it names the account unless a
               // remark was given. Magpie shows metadata.label beside the host.
@@ -414,7 +414,6 @@ const server = async ({ client } = {}, _options = {}) => {
                 baseUrl,
                 username,
                 userId,
-                token,
               })
               const metadata = {
                 baseUrl,
@@ -429,9 +428,6 @@ const server = async ({ client } = {}, _options = {}) => {
                 checkinMode: "login",
                 loginUsername: loginUsername || username,
                 loginPassword,
-                // The site hands out a token at login; keep it so the usage
-                // window still reads this account's balance.
-                token: probed?.token || token || "",
                 detectedAt: new Date().toISOString(),
               }
               await toast(`${label} 已添加（登录式签到）`, "info")
@@ -439,7 +435,7 @@ const server = async ({ client } = {}, _options = {}) => {
               // them would otherwise share one key and overwrite each other, so
               // the key falls back to the login name that makes them distinct.
               const loginKey = `${LOGIN_KEY_PREFIX}${metadata.loginUsername || username || baseUrl}`
-              return { type: "success", key: token || loginKey, metadata }
+              return { type: "success", key: loginKey, metadata }
             }
 
             if (!token) return { type: "failed", error: "请粘贴站点访问令牌" }
@@ -509,11 +505,8 @@ const server = async ({ client } = {}, _options = {}) => {
         if (!account.baseUrl) {
           return { plan, error: "账号缺少站点地址，请重新登录", windows: [] }
         }
-        if (account.platform !== "custom" && !account.token) {
-          // A login-style account checks in with its password, so a missing
-          // token only costs the balance line, not the check-in.
-          if (account.checkinMode === "login") return { plan, windows: [] }
-          return { plan, error: "账号缺少访问令牌，请重新登录", windows: [] }
+        if (account.platform !== "custom" && !account.token && !hasLogin(account)) {
+          return { plan, error: "账号缺少登录凭据，请重新登录", windows: [] }
         }
         try {
           const profile = await profileOf(account)

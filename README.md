@@ -194,7 +194,9 @@ JSON 里的普通花括号不受影响（只有 `{字母开头的名字}` 会被
 1. 添加账号时，**签到方式** 选 **登录式签到**
 2. **登录式签到：邮箱或用户名** —— 填站点登录用的**邮箱**最省事（New API 的登录接口同时接受邮箱和用户名），留空则自动取账号标签里的邮箱
 3. **登录式签到：密码** —— 站点登录密码，保存在 `plugin-auth.json` 的账号 metadata 里
-4. 访问令牌可以留空（这类站点没有可用令牌也不影响签到）；填了的话，插件会在登录前后各读一次 `/api/user/self`，用余额差算出本次奖励
+4. 访问令牌不需要填——这类站点不靠令牌读余额，插件也不会为它存任何令牌
+
+登录式账号的**余额**（用量卡数字、刷新按钮）是通过登录自动取得的**会话 Cookie** 读取的：插件在签到/查余额时 `POST /api/user/login`，从响应 `Set-Cookie` 里取出 `session=...`，用它读 `/api/user/self`。这个 Cookie 只在进程内缓存 **30 分钟**，过期自动重新登录再取，**从不落盘、也不写进 `plugin-auth.json`**。
 
 登录名的取值顺序：**手填的登录名 → 账号标签里的邮箱 → 账号用户名**。之所以优先邮箱，是因为这类站点常用 GitHub / LinuxDO 登录，账号里存的 `username` 是 `github_100001` 这种内部名，而用户在站点上记住的、以及顺手设置的密码都对应邮箱。
 
@@ -205,33 +207,29 @@ JSON 里的普通花括号不受影响（只有 `{字母开头的名字}` 会被
 - 登录成功且 `data.checked_in === true` → `claimed`，奖励取登录前后余额差（换算成 USD）
 - 登录成功但 `checked_in` 不为真 → `done`（今天已经签过）
 - 密码错误 → `failed`；账号被封禁 → `ineligible`；要求人机验证 → `captcha`
-- 站点若在登录响应里换了新的 `access_token`，结果里会提示重新添加账号
 
 典型站点：`https://agentrouter.org`（Agent Router）。
 
 ### 给已经添加过的账号补密码
 
-Magpie 的**添加账号**对话框只在「新加一个账号」时出现，已经加进去的账号点不进去补填 —— 所以插件带了这个脚本，不用删掉重加（重加会丢令牌）。
+Magpie 的**添加账号**对话框只在「新加一个账号」时出现，已经加进去的账号点不进去补填 —— 所以插件带了这个脚本，不用删掉重加（登录式账号重加会重走一次登录探测，麻烦）。
 
-**最省事的办法：双击 `tools\set-login.bat`。** 它会自动做完整套填空：逐个账号问密码（输入不回显、跳过按回车），写完顺手跑一次真实签到把结果显示出来。
+**最省事的办法：双击 `tools\edit-account.bat`。** 它会列出本插件的所有账号，逐个问是否修改备注 / 用户 ID / 站点 API Key / 登录名 / 登录密码（输入不回显、回车保持原值）。
 
 命令行用法（在插件目录下）：
 
 ```bash
 # 先列出账号，看哪些还没配置
-node tools/set-login.mjs
+node tools/edit-account.mjs
 
-# 给某个账号补密码：交互输入，不回显；写完立刻真登录一次验证并打印签到结果
-node tools/set-login.mjs "user@example.com"
+# 编辑匹配的账号：交互逐项修改（按 key / 备注 / 用户名 / 邮箱 / 登录名匹配）
+node tools/edit-account.mjs "user@example.com"
 
-# 或者一次把还没配置的账号都过一遍（双击 bat 等同于这条）
-node tools/set-login.mjs --all
-
-# 站点登录得用别的名字时（默认会优先用标签里的邮箱，通常不用管）
-node tools/set-login.mjs --as github_100001 "user@example.com"
+# 指定 magpie 配置目录（默认 %USERPROFILE%\.config\magpie）
+node tools/edit-account.mjs --dir "D:\path\to\.config\magpie" "user@example.com"
 ```
 
-脚本会先备份 `plugin-auth.json`，用填的密码真登录一次——密码错了就什么都不写；密码对了才落盘，并顺手把登录时下发的令牌、用户 ID、站点名一并更新，最后跑一次真实签到把结果打出来。密码只在那个进程的内存里出现，不打印、不写日志。
+保存前会打印「已修改：N 项（字段名）」并要求 `y` 确认；确认后先把旧文件备份成 `plugin-auth.json.bak-<时间戳>` 再写回。密码只在那个进程的内存里出现，不打印、不写日志；工具本身**不读取、不打印**任何已保存的令牌。
 
 改完如果 Magpie 正开着，重启一次让它重新读账号配置；然后在 **设置 → 用量 → 插件** 里把 **API 签到** 的 **Daily check-in** 打开。
 
@@ -307,7 +305,7 @@ magpie plugin login api-checkin
 
 | 现象 | 处理 |
 | --- | --- |
-| 登录失败「访问令牌被站点拒绝」 | 令牌错/过期；确认复制的是用户访问令牌而不是 `sk-`；只认 Cookie 的站点改贴 `session=...` |
+| 登录失败「访问令牌被站点拒绝」 | 令牌错/过期；确认复制的是用户访问令牌而不是 `sk-`；只认 Cookie 的站点改贴 `session=...`；登录式账号则确认**密码**正确（余额走登录自动取得的会话 Cookie，无需手填令牌） |
 | 签到提示「访问令牌已失效或没有权限（HTTP 403）」 | 403 **不一定**是令牌失效。很多魔改 new-api 把 `/api/user/checkin` 留作管理员接口（403），用户的签到在自定义路径；把站点类型换成「自定义接口」并填真实路径 |
 | 「站点要求提供用户 ID」 | 重新登录，在「用户 ID」里填站点控制台里的数字 ID；自定义接口也可以把 ID 写进请求头，例如 `"New-API-User":"{userId}"` |
 | 自定义接口返回 404/405 | 检查「接口地址」；相对路径要以 `/` 开头或直接填完整 URL。注意站点地址会自动去掉 `/v1`、`/api/v1` 后缀 |
@@ -353,16 +351,14 @@ lib/platforms.mjs      平台探测 + new-api / sub2api / sub2api Pro 的签到�
 lib/results.mjs        Magpie auth.checkin 的返回形状（outcome/credit/streak/message）
 lib/values.mjs         JSON 路径、金额/连续天数提取
 test/                  node:test 单元测试 + 本地 HTTP mock 端到端测试
-tools/set-login.mjs    给已有账号补登录密码（备份、真登录校验、写完立即签一次）
-tools/fake-site.mjs    本地假站点，用来验证登录式签到链路
-tools/verify-set-login.mjs  配套断言脚本
+tools/edit-account.mjs  编辑已保存账号：改备注 / 用户 ID / API Key / 登录名 / 登录密码（不打印密钥，写前备份）
 ```
 
 ### 已验证
 
-- 单元测试与本地 HTTP mock：95/95 通过（Node 24）
+- 单元测试与本地 HTTP mock：123/123 通过（Node 24）
 - 从 Magpie **0.1.1560** 的插件宿主代码核对了 `auth.checkin` 契约：返回 `outcome`（`claimed` / `done` / `ineligible` / `inactive` / `captcha` / `failed`）、`credit`、`streak`、`message`；Magpie 按北京日调度，并在失败后重试
-- **登录式签到**（Magpie 0.1.4656 + 本地假站点）：`tools/set-login.mjs` 写入密码 → 登录 → `checked_in: true` → 结果 `claimed`，奖励按余额差算出 `25 USD`，令牌被刷新、其他账号未受影响
+- **登录式签到**（Magpie 0.1.4656 + 本地假站点）：写入密码 → 登录 → `checked_in: true` → 结果 `claimed`，奖励按余额差算出 `25 USD`，其他账号未受影响
 - **登录式签到的错误分支**（真实站点 `https://agentrouter.org`，new-api 二次开发）：密码错误返回 `failed: 登录失败：用户名或密码错误，或用户已被封禁`，且不写盘；该站未提供 `/api/user/checkin`（统一返回 `{"message":"无权进行此操作，权限不足","success":false}`），配置登录式签到后不再误报为可签站点
 - **邮箱或用户名均可登录**（同站）：`{"username":"<邮箱>","password":"…"}` 与 `{"username":"<站点用户名>","password":"…"}` 得到同样的鉴权响应（密码对时同样能登录），因此 `loginNameOf` 优先取邮箱
 - **Turnstile 关闭时可用令牌换取资料**：同站 `/api/status` 返回 `turnstile_check: false`，`/api/user/self` 返回的 `password` / `original_password` 均为空串，因此本插件不会因为读资料而泄露站点已保存的密码

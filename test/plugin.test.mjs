@@ -215,8 +215,9 @@ test("a login-style sign-in names the account after the e-mail and keys it apart
     assert.equal(result.metadata.label, "user@example.com")
     assert.match(result.metadata.email, /^user\@example\.com · 127\.0\.0\.1/)
     assert.equal(result.metadata.loginUsername, "user@example.com")
-    // The token from the login is kept so the usage window still reads it.
-    assert.equal(result.metadata.token, "tok-fresh")
+    // A login-style account stores no access token: its balance is read with
+    // the session cookie this login earns, never with a Bearer token.
+    assert.equal(result.metadata.token, undefined)
     // A keyless login-style account is keyed apart from every other one.
     assert.match(result.key, /^login:user\@example\.com$/)
   } finally {

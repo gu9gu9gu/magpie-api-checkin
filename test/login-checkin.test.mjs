@@ -3,11 +3,22 @@ import assert from "node:assert/strict"
 
 import { checkinOf } from "../lib/platforms.mjs"
 import { loginCheckin, loginOnce, loginProfile } from "../lib/login-checkin.mjs"
+import { clearSessionCookies } from "../lib/session-cookie.mjs"
+
+// sessionCookie caches per login across calls; keep tests isolated.
+test.beforeEach(() => clearSessionCookies())
 
 const json = (body, status = 200) =>
   new Response(JSON.stringify(body), {
     status,
     headers: { "content-type": "application/json" },
+  })
+
+// A login that also issues a session cookie, so quotaBefore can read a before.
+const jsonCookie = (body, cookie) =>
+  new Response(JSON.stringify(body), {
+    status: 200,
+    headers: { "content-type": "application/json", "set-cookie": cookie },
   })
 
 const text = (body, status = 200, type = "text/plain") =>
@@ -61,10 +72,13 @@ test("login-checkin: a login that awards quota is claimed with its credit", asyn
     "GET /api/user/self": () =>
       json({ success: true, data: { id: 7, username: "alice", quota: 1_000_000 } }),
     "POST /api/user/login": () =>
-      json({
-        success: true,
-        data: { id: 7, username: "alice", quota: 13_500_000, checked_in: true, streak: 4 },
-      }),
+      jsonCookie(
+        {
+          success: true,
+          data: { id: 7, username: "alice", quota: 13_500_000, checked_in: true, streak: 4 },
+        },
+        "session=s1; Path=/",
+      ),
   })
 
   const result = await loginCheckin(makeAccount(fetchImpl))
@@ -147,20 +161,22 @@ test("login-checkin: turnstile on the site stops before logging in", async () =>
   )
 })
 
-test("login-checkin: a new access token in the login reply is announced", async () => {
+test("login-checkin: a login that awards quota needs a session cookie for its before", async () => {
   const { fetchImpl } = makeFetch({
     "GET /api/status": STATUS,
-    "GET /api/user/self": () => json({ success: true, data: { id: 7, quota: 0 } }),
+    "GET /api/user/self": () =>
+      jsonCookie({ success: true, data: { id: 7, quota: 5_000_000 } }, "session=s1; Path=/"),
     "POST /api/user/login": () =>
-      json({
-        success: true,
-        data: { id: 7, quota: 500_000, checked_in: true, access_token: "fresh-token" },
-      }),
+      jsonCookie(
+        { success: true, data: { id: 7, quota: 5_500_000, checked_in: true } },
+        "session=s1; Path=/",
+      ),
   })
 
   const result = await loginCheckin(makeAccount(fetchImpl))
   assert.equal(result.outcome, "claimed")
-  assert.match(result.message, /新的访问令牌/)
+  // 5_500_000 - 5_000_000 = 500_000 / 500_000 per-unit = 1.
+  assert.equal(result.credit, 1)
 })
 
 test("login-checkin: no stored token still checks in", async () => {

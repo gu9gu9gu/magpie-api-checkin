@@ -173,7 +173,7 @@ test("accountOf keeps a custom endpoint config, including tokenless accounts", (
   assert.equal(withToken.noToken, false)
 })
 
-test("a login-keyed account keeps its own token and never reads the key as one", () => {
+test("a login-keyed account has no token, only the login name for its key", () => {
   const keyed = accountOf({
     type: "api",
     key: "login:user@example.com",
@@ -186,9 +186,11 @@ test("a login-keyed account keeps its own token and never reads the key as one",
       token: "tok-from-login",
     },
   })
-  // The key names the account; the token it logs in with lives in metadata.
-  assert.equal(keyed.token, "tok-from-login")
-  assert.equal(keyed.noToken, false)
+  // A login-style account signs in with the password beside it and reads its
+  // balance with the session cookie that sign-in earns, so nothing here is a
+  // token: not the key, and not a stale token left in metadata either.
+  assert.equal(keyed.token, "user@example.com")
+  assert.equal(keyed.noToken, true)
   assert.equal(keyed.checkinMode, "login")
   assert.equal(keyed.loginCheckin.username, "user@example.com")
   assert.equal(keyed.loginCheckin.password, "pw")
@@ -203,8 +205,8 @@ test("a login-keyed account keeps its own token and never reads the key as one",
       loginPassword: "pw",
     },
   })
-  // No token yet: the login still works and the key is not mistaken for one.
-  assert.equal(bare.token, "")
+  // No token in metadata: the token is still the login name, not the key.
+  assert.equal(bare.token, "user@example.com")
   assert.equal(bare.noToken, true)
   assert.equal(isLoginCheckin(bare), true)
 })

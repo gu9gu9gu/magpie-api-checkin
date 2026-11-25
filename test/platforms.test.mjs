@@ -372,6 +372,35 @@ test("profileOf: new-api balance uses quota_per_unit", async () => {
   assert.equal(profile.siteName, "Demo")
 })
 
+test("profileOf: a token the site rejects falls back to the saved login's session", async () => {
+  // /api/user/self answers JSON when a session cookie is present and rejects
+  // the Bearer token otherwise, so newApiSelf must fall back to the login.
+  const cookie = (body) =>
+    new Response(JSON.stringify(body), {
+      status: 200,
+      headers: { "content-type": "application/json", "set-cookie": "session=s; Path=/" },
+    })
+  const { fetchImpl, calls } = makeFetch({
+    "GET /api/status": () =>
+      json({ success: true, data: { system_name: "Demo", quota_per_unit: 1_000_000 } }),
+    "GET /api/user/self": ({ init }) => {
+      if (init.headers && init.headers.Cookie) {
+        return cookie({ success: true, data: { id: 7, username: "alice", quota: 250_000 } })
+      }
+      return json({ success: false, message: "无权进行此操作，access token 无效" })
+    },
+    "POST /api/user/login": () => cookie({ success: true, data: { id: 7, username: "alice", quota: 250_000 } }),
+  })
+
+  const account = makeAccount("new-api", fetchImpl, {
+    token: "expired-token",
+    loginCheckin: { mode: "login", username: "alice@example.com", password: "pw" },
+  })
+  const profile = await profileOf(account)
+  assert.equal(profile.balance, 0.25)
+  assert.equal(calls.some((call) => call.path === "/api/user/login"), true)
+})
+
 test("sub2Envelope understands {code,message,data} and {success,data}", () => {
   assert.equal(sub2Envelope({ code: 0, data: { enabled: true } }).ok, true)
   assert.equal(sub2Envelope({ success: true, data: {} }).ok, true)
