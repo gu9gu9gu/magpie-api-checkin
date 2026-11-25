@@ -10,12 +10,12 @@
 // the Auto check-in switch.
 
 import {
-  LOGIN_KEY_PREFIX,
   NO_TOKEN_KEY,
   PLATFORM_LABELS,
   accountOf,
   displayLabel,
   isValidPlatform,
+  LOGIN_KEY_PREFIX,
   jwtUserId,
   jwtUsername,
   normalizeBaseUrl,
@@ -24,6 +24,13 @@ import {
 import { validateCustomConfig } from "./lib/config.mjs"
 import { finiteNumber, nonEmptyString } from "./lib/http.mjs"
 import { PlatformError, checkinOf, detectPlatform, listModelIds, profileOf } from "./lib/platforms.mjs"
+import {
+  inputsFromSaved,
+  maskToken,
+  savedAccountHint,
+  savedAccountTitle,
+  savedApiCheckinAccounts,
+} from "./lib/saved.mjs"
 import { loginProfile } from "./lib/login-checkin.mjs"
 import { hasLogin } from "./lib/session-cookie.mjs"
 import { looseNumber } from "./lib/values.mjs"
@@ -54,8 +61,12 @@ const PROMPTS = [
     message: "站点地址",
     placeholder: "https://api.example.com",
     validate: (value) => {
+      const text = nonEmptyString(value)
+      // Empty keeps the saved URL in a re-login; authorize requires it on a
+      // fresh sign-in after a saved value would have been merged.
+      if (!text) return undefined
       try {
-        normalizeBaseUrl(value)
+        normalizeBaseUrl(text)
         return undefined
       } catch (error) {
         return error.message
@@ -102,6 +113,7 @@ const PROMPTS = [
     type: "select",
     key: "checkinMode",
     message: "签到方式",
+    condition: (inputs) => inputs.platform !== "custom",
     options: [
       {
         label: "标准接口（默认）",
@@ -149,7 +161,14 @@ const PROMPTS = [
     message: "自定义签到：接口地址",
     placeholder: "/api/user/checkin；也可填完整 URL；支持 {baseUrl} {token} 等占位符",
     when: CUSTOM_WHEN,
-    validate: (value) => (nonEmptyString(value) ? undefined : "请填写签到接口地址，例如 /api/user/checkin"),
+    validate: (value) => {
+      const text = nonEmptyString(value)
+      // Empty keeps the saved custom URL in a re-login; validateCustomConfig
+      // requires one after the saved value has been merged.
+      if (!text) return undefined
+      if (/\s/.test(text)) return "签到接口地址不能包含空格"
+      return undefined
+    },
   },
   {
     type: "text",
@@ -225,6 +244,267 @@ const PROMPTS = [
   },
 ]
 
+// Re-login reuse: Magpie starts a sign-in with empty inputs, so these
+// questions come first and let an expired account keep its URL, platform,
+// headers and body. The token is the only thing an expired account is
+// usually missing.
+const REUSE_ACTION = "_reuse_action"
+const REUSE_ACCOUNT = "_reuse_account"
+const REUSE_MODE = "_reuse_mode"
+
+function promptApplies(prompt, inputs) {
+  if (prompt.when) {
+    const value = inputs[prompt.when.key]
+    if (value === undefined) return false
+    const equal = value === prompt.when.value
+    if (prompt.when.op === "eq" ? !equal : equal) return false
+  }
+  if (typeof prompt.condition === "function" && !prompt.condition(inputs)) return false
+  return true
+}
+
+function plainPrompt(prompt, placeholders = {}) {
+  const suggested = placeholders[prompt.key]
+  const out = {
+    type: prompt.type,
+    key: prompt.key,
+    message: prompt.message,
+    placeholder: nonEmptyString(suggested) || prompt.placeholder || "",
+  }
+  if (prompt.type === "select") {
+    out.options = prompt.options.map((option) => ({
+      label: option.label,
+      value: option.value,
+      hint: option.hint ?? "",
+    }))
+  }
+  return out
+}
+
+/** The next of the normal sign-in questions for the answers so far. */
+function nextPlainPrompt(inputs, options = {}) {
+  const skip = options.skip || new Set()
+  const placeholders = options.placeholders || {}
+  for (const prompt of PROMPTS) {
+    if (prompt.key in inputs) continue
+    if (skip.has(prompt.key)) continue
+    if (!promptApplies(prompt, inputs)) continue
+    return plainPrompt(prompt, placeholders)
+  }
+  return null
+}
+
+/** A select's "keep the saved value" button, first so it is the default. */
+function withKeepOption(prompt, saved) {
+  if (!prompt) return null
+  if (prompt.key === "platform" && saved.platform) {
+    prompt.options = [
+      {
+        label: `保持上次（${PLATFORM_LABELS[saved.platform] || saved.platform}）`,
+        value: saved.platform,
+        hint: "沿用上次的站点类型",
+      },
+      ...prompt.options.filter((option) => option.value !== saved.platform),
+    ]
+  }
+  if (prompt.key === "customMethod" && saved.customMethod) {
+    prompt.options = [
+      {
+        label: `保持上次（${saved.customMethod}）`,
+        value: saved.customMethod,
+        hint: "沿用上次的请求方法",
+      },
+      ...prompt.options.filter((option) => option.value !== saved.customMethod),
+    ]
+  }
+  return prompt
+}
+
+// The placeholders show what is saved; an empty answer keeps it. Headers and
+// bodies say so instead of printing a value that may hold a secret.
+function savedPlaceholders(saved, withToken = false) {
+  const placeholders = {
+    url: saved.url,
+    label: saved.label,
+    userId: saved.userId,
+    apiKey: saved.apiKey ? maskToken(saved.apiKey) : "",
+    customUrl: saved.customUrl,
+    customHeaders: saved.customHeaders
+      ? "留空沿用上次的请求头；要修改请粘贴完整的新值"
+      : "",
+    customBody: saved.customBody ? "留空沿用上次的请求体；要修改请粘贴完整的新值" : "",
+    customSuccess: saved.customSuccess,
+    customAlready: saved.customAlready,
+    customCreditField: saved.customCreditField,
+    customCreditDivisor: saved.customCreditDivisor,
+    customStreakField: saved.customStreakField,
+    customBalanceUrl: saved.customBalanceUrl,
+    customBalanceField: saved.customBalanceField,
+    customBalanceDivisor: saved.customBalanceDivisor,
+  }
+  if (withToken) {
+    placeholders.token = saved.token
+      ? `上次的令牌 ${maskToken(saved.token)}；留空沿用，要换就粘贴新令牌`
+      : ""
+  }
+  return placeholders
+}
+
+async function nextReusePrompt(inputs) {
+  let accounts
+  try {
+    accounts = await savedApiCheckinAccounts()
+  } catch {
+    accounts = []
+  }
+  if (!accounts.length) return nextPlainPrompt(inputs)
+
+  // Magpie does not tell a plugin whether the user pressed "add" or
+  // "re-login", so new accounts come first and no saved site is shown
+  // until the user explicitly asks to re-login one.
+  if (!(REUSE_ACTION in inputs)) {
+    return {
+      type: "select",
+      key: REUSE_ACTION,
+      message: "要新增账号，还是重新登录已有账号？",
+      placeholder: "",
+      options: [
+        {
+          label: "添加新账号（默认）",
+          value: "new",
+          hint: "从站点地址开始填写；不显示已有站点",
+        },
+        {
+          label: "重新登录已有账号",
+          value: "reuse",
+          hint: "选择已有账号，沿用它上次的 URL、Header、Body 等配置",
+        },
+      ],
+    }
+  }
+  if (inputs[REUSE_ACTION] !== "reuse") return nextPlainPrompt(inputs)
+
+  if (!(REUSE_ACCOUNT in inputs)) {
+    return {
+      type: "select",
+      key: REUSE_ACCOUNT,
+      message: "要沿用哪个账号的配置？",
+      placeholder: "",
+      options: [
+        ...accounts.slice(0, 10).map((account) => ({
+          label: savedAccountTitle(account),
+          value: account.sourceKey,
+          hint: savedAccountHint(account),
+        })),
+        { label: "重新填写全部", value: "new", hint: "不沿用，逐项重新填写" },
+      ],
+    }
+  }
+
+  if (inputs[REUSE_ACCOUNT] === "new") return nextPlainPrompt(inputs)
+  const account = accounts.find((item) => item.sourceKey === inputs[REUSE_ACCOUNT])
+  if (!account) return nextPlainPrompt(inputs)
+
+  if (!(REUSE_MODE in inputs)) {
+    return {
+      type: "select",
+      key: REUSE_MODE,
+      message: `要怎样沿用 ${savedAccountTitle(account)} 的配置？`,
+      placeholder: "",
+      options: [
+        {
+          label: "逐项确认/修改全部（预填上次值）",
+          value: "edit",
+          hint: "URL、令牌、API Key、Header、Body 等全部显示；留空沿用",
+        },
+        {
+          label: "只更新访问令牌",
+          value: "token",
+          hint: "只问新令牌，其余全部保留",
+        },
+        {
+          label: "沿用上次令牌，只改请求配置",
+          value: "request",
+          hint: "URL、平台、Header、Body 等可以改；令牌保留",
+        },
+        {
+          label: "完全沿用（包括令牌）",
+          value: "all",
+          hint: "不再提问，直接用上次配置登录",
+        },
+        { label: "重新填写全部", value: "new", hint: "不沿用，逐项重新填写" },
+      ],
+    }
+  }
+
+  const saved = inputsFromSaved(account)
+  if (inputs[REUSE_MODE] === "edit") {
+    return withKeepOption(
+      nextPlainPrompt(inputs, { placeholders: savedPlaceholders(saved, true) }),
+      saved,
+    )
+  }
+  if (inputs[REUSE_MODE] === "request") {
+    return withKeepOption(
+      nextPlainPrompt(inputs, {
+        skip: new Set(["token"]),
+        placeholders: savedPlaceholders(saved),
+      }),
+      saved,
+    )
+  }
+  if (inputs[REUSE_MODE] === "token") {
+    if ("token" in inputs) return null
+    return {
+      type: "password",
+      key: "token",
+      message: "新的访问令牌 / JWT / Cookie",
+      placeholder: account.token
+        ? `粘贴新的令牌；留空则继续使用上次的 ${maskToken(account.token)}`
+        : "粘贴访问令牌；这个账号上次没有令牌",
+    }
+  }
+  if (inputs[REUSE_MODE] === "all") return null
+  return nextPlainPrompt(inputs)
+}
+
+/**
+ * The answers a re-login stands for. Only a reuse chosen at the first
+ * question is resolved; adding a new account never touches saved entries.
+ */
+async function resolveReuseInputs(inputs) {
+  if (inputs[REUSE_ACTION] !== "reuse") return { inputs }
+  const mode = inputs[REUSE_MODE]
+  if (mode !== "all" && mode !== "token" && mode !== "request" && mode !== "edit") {
+    return { inputs }
+  }
+  let accounts
+  try {
+    accounts = await savedApiCheckinAccounts()
+  } catch {
+    accounts = []
+  }
+  const account = accounts.find((item) => item.sourceKey === inputs[REUSE_ACCOUNT])
+  if (!account) {
+    return { error: "无法读取上次的账号配置：请重新登录并选择「重新填写全部」" }
+  }
+  const saved = inputsFromSaved(account)
+  if (mode === "edit" || mode === "request") {
+    // Blank answers keep the saved value; typed answers replace it.
+    const provided = {}
+    for (const [key, value] of Object.entries(inputs)) {
+      if (key.startsWith("_")) continue
+      if (typeof value !== "string" || value.trim() === "") continue
+      provided[key] = value
+    }
+    const token =
+      mode === "edit" ? nonEmptyString(inputs.token) || saved.token : saved.token
+    return { inputs: { ...saved, ...provided, token }, reused: true, mode }
+  }
+  const token = mode === "token" ? nonEmptyString(inputs.token) || saved.token : saved.token
+  return { inputs: { ...saved, token }, reused: true, mode }
+}
+
 function userIdOf(input, fallback) {
   const text = nonEmptyString(input)
   if (!text) return fallback
@@ -233,6 +513,14 @@ function userIdOf(input, fallback) {
     throw new Error("用户 ID 必须是正整数")
   }
   return n
+}
+
+/** A stated user id that the token's own profile contradicts. */
+function userIdMismatch(stated, actual) {
+  const tokenUserId = finiteNumber(actual)
+  if (stated === undefined || tokenUserId === undefined || tokenUserId <= 0) return ""
+  if (Math.trunc(tokenUserId) === stated) return ""
+  return `用户 ID 与令牌不匹配：令牌属于 #${Math.trunc(tokenUserId)}，你填写的是 #${stated}。一个站点多个用户时，请为每个账号使用各自的令牌和用户 ID。`
 }
 
 function modelEntry(id, baseUrl) {
@@ -288,11 +576,25 @@ const server = async ({ client } = {}, _options = {}) => {
           label: "添加站点账号",
           prompts: PROMPTS,
 
+          // Magpie starts every sign-in with empty inputs. These questions
+          // offer the accounts it already has, so re-logging in an expired
+          // account can keep its URL, headers and body and change only what
+          // is stale.
+          async ask(inputs = {}) {
+            return nextReusePrompt(inputs)
+          },
+
           // Runs after the questions above; the key it returns is kept as the
           // account's credential by Magpie (the access token), and metadata is
           // everything else the hooks need. Magpie only skips its own key
           // field for a keyless method that has this function.
-          async authorize(inputs = {}) {
+          async authorize(rawInputs = {}) {
+            const resolved = await resolveReuseInputs(rawInputs)
+            if (resolved.error) return { type: "failed", error: resolved.error }
+            const inputs = resolved.inputs
+            const reused = resolved.reused === true
+            const reuseMode = resolved.mode || ""
+
             let baseUrl
             try {
               baseUrl = normalizeBaseUrl(inputs.url)
@@ -320,7 +622,13 @@ const server = async ({ client } = {}, _options = {}) => {
               try {
                 custom = validateCustomConfig(inputs, { token })
               } catch (error) {
-                return { type: "failed", error: error.message }
+                const hint =
+                  reuseMode === "request"
+                    ? "（请检查新的自定义请求配置；留空的项会沿用上次值）"
+                    : reused
+                      ? "（上次的自定义配置不完整，请选择「重新填写全部」）"
+                      : ""
+                return { type: "failed", error: `${error.message}${hint}` }
               }
 
               let detected = null
@@ -338,6 +646,8 @@ const server = async ({ client } = {}, _options = {}) => {
                 }
               }
               const profile = detected?.profile
+              const mismatch = userIdMismatch(statedUserId, profile?.userId)
+              if (mismatch) return { type: "failed", error: mismatch }
               const userId = statedUserId ?? profile?.userId ?? jwtUserId(token)
               const username = profile?.username || jwtUsername(token)
               const label = displayLabel({
@@ -360,9 +670,13 @@ const server = async ({ client } = {}, _options = {}) => {
                 quotaPerUnit: profile?.quotaPerUnit || 500_000,
                 apiKey: nonEmptyString(inputs.apiKey),
                 custom,
+                token,
                 detectedAt: new Date().toISOString(),
               }
-              await toast(`${label} 已添加（自定义签到 ${custom.method} ${custom.url}）`, "info")
+              await toast(
+                `${label} 已添加（自定义签到 ${custom.method} ${custom.url}）${reused ? " · 沿用上次配置" : ""}`,
+                "info",
+              )
               return { type: "success", key: token || NO_TOKEN_KEY, metadata }
             }
 
@@ -371,8 +685,6 @@ const server = async ({ client } = {}, _options = {}) => {
             // access token is stored: the balance is read with the short-lived
             // session cookie this login earns (lib/session-cookie.mjs).
             if (nonEmptyString(inputs.checkinMode) === "login") {
-              // New API accepts either the account name or its e-mail here; the
-              // label Magpie shows is normally the e-mail, so it is the fallback.
               const loginUsername =
                 nonEmptyString(inputs.loginUsername) || nonEmptyString(inputs.label)
               const loginPassword = nonEmptyString(inputs.loginPassword)
@@ -401,9 +713,6 @@ const server = async ({ client } = {}, _options = {}) => {
               const profile = probed?.profile
               const userId = statedUserId ?? profile?.userId
               const username = profile?.username || loginUsername || ""
-              // The e-mail is what the person recognises on such a site, and it
-              // is also what they sign in with, so it names the account unless a
-              // remark was given. Magpie shows metadata.label beside the host.
               const remark =
                 nonEmptyString(inputs.label) ||
                 profile?.email ||
@@ -431,14 +740,18 @@ const server = async ({ client } = {}, _options = {}) => {
                 detectedAt: new Date().toISOString(),
               }
               await toast(`${label} 已添加（登录式签到）`, "info")
-              // A login-style account may have no token at all, and several of
-              // them would otherwise share one key and overwrite each other, so
-              // the key falls back to the login name that makes them distinct.
               const loginKey = `${LOGIN_KEY_PREFIX}${metadata.loginUsername || username || baseUrl}`
               return { type: "success", key: loginKey, metadata }
             }
 
-            if (!token) return { type: "failed", error: "请粘贴站点访问令牌" }
+            if (!token) {
+              return {
+                type: "failed",
+                error: reused
+                  ? "上次配置里没有可用的访问令牌：请重新登录并选择「只更新访问令牌」"
+                  : "请粘贴站点访问令牌",
+              }
+            }
             let userId
             try {
               userId = userIdOf(inputs.userId, jwtUserId(token))
@@ -457,9 +770,17 @@ const server = async ({ client } = {}, _options = {}) => {
             try {
               found = await detectPlatform(account)
             } catch (error) {
-              return { type: "failed", error: String(error.message || error).slice(0, 500) }
+              const hint =
+                reuseMode === "request"
+                  ? "（请检查新的站点地址/平台；令牌沿用上次的）"
+                  : reused
+                    ? "（沿用上次配置失败；如果账号的令牌已失效，请重新登录并选择「只更新访问令牌」）"
+                    : ""
+              return { type: "failed", error: `${String(error.message || error).slice(0, 500)}${hint}` }
             }
             const profile = found.profile
+            const mismatch = userIdMismatch(statedUserId, profile.userId)
+            if (mismatch) return { type: "failed", error: mismatch }
             const label = displayLabel({
               label: inputs.label,
               baseUrl,
@@ -478,9 +799,13 @@ const server = async ({ client } = {}, _options = {}) => {
               siteName: profile.siteName || "",
               quotaPerUnit: profile.quotaPerUnit || 500_000,
               apiKey: nonEmptyString(inputs.apiKey),
+              token,
               detectedAt: new Date().toISOString(),
             }
-            await toast(`${label} 已添加（${PLATFORM_LABELS[found.platform]}）`, "info")
+            await toast(
+              `${label} 已添加（${PLATFORM_LABELS[found.platform]}）${reused ? " · 沿用上次配置" : ""}`,
+              "info",
+            )
             return { type: "success", key: token, metadata }
           },
         },
@@ -505,8 +830,8 @@ const server = async ({ client } = {}, _options = {}) => {
         if (!account.baseUrl) {
           return { plan, error: "账号缺少站点地址，请重新登录", windows: [] }
         }
-        if (account.platform !== "custom" && !account.token && !hasLogin(account)) {
-          return { plan, error: "账号缺少登录凭据，请重新登录", windows: [] }
+        if (account.platform !== "custom" && !account.token) {
+          return { plan, error: "账号缺少访问令牌，请重新登录", windows: [] }
         }
         try {
           const profile = await profileOf(account)
